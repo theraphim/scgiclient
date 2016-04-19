@@ -9,149 +9,111 @@ package scgiclient
 
 import (
 	"bufio"
-	"bytes"
-	"errors"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"net"
+	"net/http"
+	"net/textproto"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 )
 
-// Send sends and scgi request to addr, with
-// all the data read from r as the body of the request.
-// The received response is returned and the connection
-// to addr is closed.
-func Send(addr string, r io.Reader) (*Response, error) {
-	var conn net.Conn
+type SCGITransport struct{}
 
-	fi, err := os.Stat(addr)
-
-	if err == nil && fi.Mode()&os.ModeSocket != 0 {
-		conn, err = net.Dial("unix", addr)
-	} else {
-		conn, err = net.Dial("tcp", addr)
-	}
-	if err != nil {
-		return nil, err
-	}
-	defer conn.Close()
-	body, err := ioutil.ReadAll(r)
-	if err != nil {
-		return nil, err
-	}
-	req := NewRequest(addr, body)
-	req.conn = conn
-	if _, err = req.Send(); err != nil {
-		return nil, err
-	}
-	return req.Receive()
-}
-
-type Request struct {
-	Addr   string
-	Header []byte
-	Body   []byte
-	conn   net.Conn
-}
-
-// NewRequest returns a Request ready to be sent with
-// Request.Send().
-func NewRequest(addr string, body []byte) *Request {
-	return &Request{
-		Addr:   addr,
-		Header: defaultHeader(len(body)),
-		Body:   body,
-	}
-}
-
-// Close closes the connection to r.Addr.
-func (r *Request) Close() error {
-	return r.conn.Close()
-}
-
-// Send sends an scgi message built with
-// r.Header and r.Body, to r.Addr. It returns the
-// number of bytes sent and an error, if any.
-func (r *Request) Send() (int64, error) {
-	var err error
-	if r.conn == nil {
-		r.conn, err = net.Dial("tcp", r.Addr)
-		if err != nil {
-			return 0, err
+func dialurl(u *url.URL) (net.Conn, error) {
+	if u.Host == "" {
+		fi, err := os.Stat(u.Path)
+		if err == nil && fi.Mode()&os.ModeSocket != 0 {
+			return net.Dial("unix", u.Path)
 		}
+		return nil, fmt.Errorf("%+v", u)
 	}
-	msg := append(netstring(r.Header), r.Body...)
-	return io.Copy(r.conn, bytes.NewReader(msg))
+	return net.Dial("tcp", u.Host)
 }
 
-// Receive reads the response from r.Addr and returns
-// it in a Response. The connection to r.Addr must already
-// be established.
-func (r *Request) Receive() (*Response, error) {
-	if r.conn == nil {
-		return nil, errors.New("Can not receive on a closed connection")
+func (s SCGITransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	conn, err := dialurl(r.URL)
+	if err != nil {
+		return nil, err
 	}
-	return receive(r.conn)
+	encoded, err := Encode(r)
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+
+	if _, err := conn.Write(encoded); err != nil {
+		conn.Close()
+		return nil, err
+	}
+	return Receive(conn, r)
 }
 
-type Response struct {
-	Header map[string]string
-	Body   []byte
-	conn   net.Conn
+func Encode(r *http.Request) ([]byte, error) {
+	body, err := ioutil.ReadAll(r.Body)
+	if err != nil {
+		return nil, err
+	}
+	return append(netstring(defaultHeader(len(body))), body...), nil
 }
 
-// Close closes the connection to r.Addr.
-func (r *Response) Close() error {
-	return r.conn.Close()
+type combireader struct {
+	*bufio.Reader
+	conn net.Conn
 }
 
-func receive(conn net.Conn) (*Response, error) {
+func (cr combireader) Close() error {
+	return cr.conn.Close()
+}
+
+func Receive(conn net.Conn, req *http.Request) (*http.Response, error) {
 	r := bufio.NewReader(conn)
-	header := make(map[string]string)
-	terminator := string([]byte{13, 10})
-	for {
-		line, err := r.ReadString('\n')
-		if err != nil {
-			return nil, err
-		}
-		line = strings.TrimRight(line, terminator)
-		if line == "" {
-			break
-		}
-		keyValue := strings.SplitN(line, ": ", 2)
-		if len(keyValue) != 2 {
-			return nil, fmt.Errorf("Bogus header line in response: %q", line)
-		}
-		header[keyValue[0]] = keyValue[1]
+	resp := &http.Response{
+		Request: req,
 	}
-
-	resp := &Response{
-		Header: header,
+	tp := textproto.NewReader(r)
+	mimeHeader, err := tp.ReadMIMEHeader()
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	status, ok := mimeHeader["Status"]
+	if !ok {
+		conn.Close()
+		return nil, fmt.Errorf("ffuuu")
+	}
+	resp.Status = status[0]
+	f := strings.SplitN(resp.Status, " ", 2)
+	resp.StatusCode, err = strconv.Atoi(f[0])
+	if err != nil {
+		conn.Close()
+		return nil, err
+	}
+	resp.Header = http.Header(mimeHeader)
+	resp.Body = combireader{
+		Reader: r,
 		conn:   conn,
 	}
-	status, ok := header["Status"]
-	if !ok {
-		return nil, errors.New("Did not get a status line in response header")
-	}
-	if status != "200 OK" {
-		return resp, fmt.Errorf("Got %v as response status", status)
-	}
-	var body bytes.Buffer
-	if _, err := io.Copy(&body, r); err != nil {
-		return nil, fmt.Errorf("Could not read response: %v", err)
-	}
-	resp.Body = body.Bytes()
 	return resp, nil
 }
 
+type kv struct {
+	name, value string
+}
+
 func defaultHeader(bodyLen int) []byte {
+	headerFields := []kv{
+		{"CONTENT_LENGTH", strconv.Itoa(bodyLen)},
+		{"SCGI", "1"},
+		{"REQUEST_METHOD", "POST"},
+		{"SERVER_PROTOCOL", "HTTP/1.1"},
+	}
+
 	var dh []byte
-	defaultHeaderFields["CONTENT_LENGTH"] = strconv.Itoa(bodyLen)
-	for k, v := range defaultHeaderFields {
-		dh = append(dh, header(k, v)...)
+	for _, kv := range headerFields {
+		dh = append(dh, header(kv.name, kv.value)...)
 	}
 	return dh
 }
@@ -160,13 +122,6 @@ func header(name, value string) []byte {
 	h := append([]byte(name), 0)
 	h = append(h, []byte(value)...)
 	return append(h, 0)
-}
-
-var defaultHeaderFields = map[string]string{
-	"CONTENT_LENGTH":  "",
-	"SCGI":            "1",
-	"REQUEST_METHOD":  "POST",
-	"SERVER_PROTOCOL": "HTTP/1.1",
 }
 
 const (
