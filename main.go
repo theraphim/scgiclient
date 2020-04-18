@@ -99,21 +99,10 @@ func Receive(conn net.Conn, req *http.Request) (*http.Response, error) {
 	return resp, nil
 }
 
-type kv struct {
-	name, value string
-}
-
 func defaultHeader(bodyLen int) []byte {
-	headerFields := []kv{
-		{"CONTENT_LENGTH", strconv.Itoa(bodyLen)},
-		{"SCGI", "1"},
-		{"REQUEST_METHOD", "POST"},
-		{"SERVER_PROTOCOL", "HTTP/1.1"},
-	}
-
-	var dh []byte
-	for _, kv := range headerFields {
-		dh = append(dh, header(kv.name, kv.value)...)
+	dh := append([]byte{}, header("CONTENT_LENGTH", strconv.Itoa(bodyLen))...)
+	for _, kv := range defaultHeaderFields {
+		dh = append(dh, header(kv.key, kv.value)...)
 	}
 	return dh
 }
@@ -122,6 +111,18 @@ func header(name, value string) []byte {
 	h := append([]byte(name), 0)
 	h = append(h, []byte(value)...)
 	return append(h, 0)
+}
+
+type headerField struct {
+	key   string
+	value string
+}
+
+// not using a map, because header fields need to be in order
+var defaultHeaderFields = []headerField{
+	{key: "SCGI", value: "1"},
+	{key: "REQUEST_METHOD", value: "POST"},
+	{key: "SERVER_PROTOCOL", value: "HTTP/1.1"},
 }
 
 const (
